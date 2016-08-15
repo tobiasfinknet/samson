@@ -44,7 +44,7 @@ gem 'coderay'
 gem 'net-http-persistent'
 gem 'concurrent-ruby'
 gem 'vault'
-gem 'docker-api'
+gem 'docker-api', git: 'git@github.com:grosser/docker-api', branch: 'grosser/ignore2' # https://github.com/swipely/docker-api/pull/438
 gem 'warden-doorkeeper'
 
 # Temporarily using our fork, while waiting for this PR to get merged:
