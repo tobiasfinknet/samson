@@ -2,6 +2,8 @@
 module Kubernetes
   module Api
     class Pod
+      attr_accessor :client # setters to fetch more information like logs/events
+
       def initialize(api_pod)
         @pod = api_pod
       end
@@ -46,6 +48,27 @@ module Kubernetes
 
       def containers
         @pod.spec.containers
+      end
+
+      def logs(container)
+        client.get_pod_log(name, namespace, previous: restarted?, container: container)
+      rescue KubeException
+        begin
+          client.get_pod_log(name, namespace, previous: !restarted?, container: container)
+        rescue KubeException
+          nil
+        end
+      end
+
+      def unschedulable?
+        events.any? { |e| e.type != "Normal" }
+      end
+
+      def events
+        @events ||= client.get_events(
+          namespace: namespace,
+          field_selector: "involvedObject.name=#{name}"
+        )
       end
 
       private

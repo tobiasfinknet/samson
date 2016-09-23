@@ -8,7 +8,8 @@ module Kubernetes
     TICK = 2.seconds
     RESTARTED = "Restarted"
 
-    ReleaseStatus = Struct.new(:live, :details, :role, :group)
+    # TODO: this logic might be able to go directly into Pod, which would simplify the code here a bit
+    ReleaseStatus = Struct.new(:live, :failed, :details, :role, :group, :pod)
 
     def initialize(output, job:, reference:)
       @output = output
@@ -74,7 +75,7 @@ module Kubernetes
               @output.puts "READY, starting stability test"
               @testing_for_stability = 0
             end
-          elsif statuses.map(&:details).include?(RESTARTED)
+          elsif statuses.any?(&:failed)
             unstable!
             return false
           elsif seconds_waiting > WAIT_FOR_LIVE
@@ -88,69 +89,61 @@ module Kubernetes
     end
 
     def pod_statuses(release, release_docs)
-      pods = release.clients.flat_map { |client, query| fetch_pods(client, query) }
+      pods = fetch_pods(release)
       release_docs.flat_map { |release_doc| release_statuses(pods, release_doc) }
     end
 
-    def fetch_pods(client, query)
-      client.get_pods(query).map! { |p| Kubernetes::Api::Pod.new(p) }
+    # efficient pod fetching by querying once per cluster instead of once per deploy group
+    def fetch_pods(release)
+      release.clients.flat_map do |client, query|
+        client.get_pods(query).map! do |p|
+          pod = Kubernetes::Api::Pod.new(p)
+          pod.client = client
+          pod
+        end
+      end
     end
 
-    def show_failure_cause(release)
-      bad_pods(release).each do |pod, client, deploy_group|
+    def show_failure_cause(release, release_docs)
+      pod_statuses(release, release_docs).reject(&:live).select(&:pod).each do |status|
+        pod = status.pod
+        deploy_group = deploy_group_for_pod(pod, release)
         @output.puts "\n#{deploy_group.name} pod #{pod.name}:"
-        print_events(client, pod)
+        print_events(pod)
         @output.puts
-        print_logs(client, pod)
+        print_logs(pod)
         @output.puts "\n------------------------------------------\n"
       end
     end
 
-    # logs - container fails to boot
-    def print_logs(client, pod)
+    # show why container failed to boot
+    def print_logs(pod)
       @output.puts "LOGS:"
 
       pod.containers.map(&:name).each do |container|
         @output.puts "Container #{container}" if pod.containers.size > 1
 
-        logs = begin
-          client.get_pod_log(pod.name, pod.namespace, previous: pod.restarted?, container: container)
-        rescue KubeException
-          begin
-            client.get_pod_log(pod.name, pod.namespace, previous: !pod.restarted?, container: container)
-          rescue KubeException
-            "No logs found"
-          end
-        end
         # Display the first and last n_lines of the log
         max = 50
-        lines = logs.split("\n")
+        lines = (pod.logs(container) || "No logs found").split("\n")
         lines = lines.first(max / 2) + ['...'] + lines.last(max / 2) if lines.size > max
         lines.each { |line| @output.puts "  #{line}" }
       end
     end
 
-    def print_events(client, pod)
+    # show what happened in kubernetes internally since we might not have any logs
+    def print_events(pod)
       @output.puts "EVENTS:"
-      events = client.get_events(
-        namespace: pod.namespace,
-        field_selector: "involvedObject.name=#{pod.name}"
-      )
+      events = pod.events
       events.uniq! { |e| e.message.split("\n").sort }
       events.each { |e| @output.puts "  #{e.reason}: #{e.message}" }
     end
 
-    def bad_pods(release)
-      release.clients.flat_map do |client, query, deploy_group|
-        bad_pods = fetch_pods(client, query).select { |p| p.restarted? || !p.live? }
-        bad_pods.map { |p| [p, client, deploy_group] }
-      end
-    end
-
     def unstable!
-      @output.puts "UNSTABLE - service is restarting"
+      @output.puts "UNSTABLE"
     end
 
+    # user clicked stop button in UI
     def stopped?
       if @stopped
         @output.puts "STOPPED"
@@ -158,6 +151,7 @@ module Kubernetes
       end
     end
 
+    # TODO: cleanup ... a bit ugly with all these arrays
     def release_statuses(pods, release_doc)
       group = release_doc.deploy_group
       role = release_doc.kubernetes_role
@@ -168,25 +162,27 @@ module Kubernetes
         pod = pods[i]
 
         if !pod
-          [false, "Missing"]
+          [false, false, "Missing", pod]
         elsif pod.live?
           if pod.restarted?
-            [false, RESTARTED]
+            [false, true, "Restarted", pod]
           else
-            [true, "Live"]
+            [true, false, "Live", pod]
           end
+        elsif pod.unschedulable?
+          [false, true, "Unschedulable", pod]
         else
-          [false, "Waiting (#{pod.phase}, #{pod.reason})"]
+          [false, false, "Waiting (#{pod.phase}, #{pod.reason})", pod]
         end
       end
 
-      statuses.map do |live, details|
-        ReleaseStatus.new(live, details, role.name, group.name)
+      statuses.map do |live, failed, details, pod|
+        ReleaseStatus.new(live, failed, details, role.name, group.name, pod)
       end
     end
 
     def print_statuses(status_groups)
-      return if @last_status_output && @last_status_output > 10.seconds.ago
+      return if @last_status_output && @last_status_output > 10.seconds.ago # FIX: increase TICK to 10 and remove this ?
 
       @last_status_output = Time.now
       @output.puts "Deploy status after #{seconds_waiting} seconds:"
@@ -321,12 +317,12 @@ module Kubernetes
       end
     end
 
-    def deploy_to_cluster(release, deploys)
-      deploy(deploys)
-      successful = wait_for_resources_to_complete(release, deploys)
+    def deploy_to_cluster(release, release_docs)
+      deploy(release_docs)
+      successful = wait_for_resources_to_complete(release, release_docs)
       unless successful
-        show_failure_cause(release)
-        rollback(deploys)
+        show_failure_cause(release, release_docs)
+        rollback(release_docs)
         @output.puts "DONE"
       end
       successful
@@ -348,6 +344,11 @@ module Kubernetes
 
     def seconds_waiting
       (Time.now - @wait_start_time).to_i if @wait_start_time
+    end
+
+    # find deploy group without extra sql queries
+    def deploy_group_for_pod(pod, release)
+      release.release_docs.detect { |rd| break rd.deploy_group if rd.deploy_group_id == pod.deploy_group_id }
     end
 
     # verify with a temp release so we can verify everything before creating a real release
