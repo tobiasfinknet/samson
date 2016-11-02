@@ -58,6 +58,8 @@ class StagesController < ApplicationController
     if @stage.update_attributes(stage_params)
       redirect_to [@project, @stage]
     else
+      # reset permalink to saved value because it is part of the post url
+      @stage.permalink = @stage.changed_attributes[:permalink] if @stage.changed_attributes.key?(:permalink)
       render :edit
     end
   end

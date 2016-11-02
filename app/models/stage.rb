@@ -28,6 +28,7 @@ class Stage < ActiveRecord::Base
   default_scope { order(:order) }
 
   validates :name, presence: true, uniqueness: { scope: [:project, :deleted_at] }
+  validates_format_of :permalink, :with => /\A[\w-]*\z/i
 
   before_create :ensure_ordering
   after_destroy :destroy_deploy_groups_stages
